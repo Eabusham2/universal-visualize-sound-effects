@@ -10,3 +10,6 @@ dist/
 *.pdb
 *.exp
 *.lib
+
+# Host unit-test binary
+tests/fft_test

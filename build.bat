@@ -14,22 +14,33 @@ if errorlevel 1 (
 )
 
 if not exist build mkdir build
+
+echo Compiling resources (manifest, icon, version info)...
+rc /nologo /fo build\resource.res resource.rc
+if errorlevel 1 goto :fail
+
 pushd build
 
 cl /nologo /O2 /W3 /MT /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN ^
    /I.. ^
    ../main.c ../overlay.c ../audio.c ../detector.c ../fft.c ../profiles.c ../settings.c ^
-   /Fe%OUT% /link /SUBSYSTEM:WINDOWS ^
+   resource.res ^
+   /Fe%OUT% /link /SUBSYSTEM:WINDOWS /MANIFEST:NO ^
    user32.lib gdi32.lib ole32.lib oleaut32.lib ^
    avrt.lib comctl32.lib uuid.lib shell32.lib
 if errorlevel 1 (
     popd
-    echo.
-    echo *** Build failed. ***
-    exit /b 1
+    goto :fail
 )
 
 echo.
 echo Built: build\%OUT%
 popd
+del /q build\*.obj >nul 2>&1
 endlocal
+goto :eof
+
+:fail
+echo.
+echo *** Build failed. ***
+exit /b 1

@@ -5,7 +5,8 @@
 #include <windows.h>
 
 typedef struct {
-    int     profile_index;     /* index into g_profiles */
+    int     profile_index;     /* index into g_profiles (resolved from profile_id on load) */
+    wchar_t profile_id[64];    /* stable profile key ("mw2_ht", ...) - survives reordering */
     wchar_t device_id[256];    /* WASAPI endpoint id ("" = system default) */
     int     sensitivity_tick;  /* 5..20  (0.5x .. 2.0x) */
     int     size;              /* 200..600 px */
