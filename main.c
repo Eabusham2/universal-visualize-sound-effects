@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <dbt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,8 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #define APP_CLASS   L"SoundOverlayLauncher"
 #define APP_TITLE   L"SoundOverlay"
+#define APP_MUTEX   L"Local\\SoundOverlayLauncher.SingleInstance"
+#define IDI_APPICON 101              /* keep in sync with resource.rc */
 
 /* Control IDs */
 #define ID_CB_DEVICE      1001
@@ -55,6 +58,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define ID_LBL_STATUS     1022
 #define ID_LBL_STATS      1023
 #define ID_LIST_LOG       1030
+#define ID_BTN_CLEARLOG   1031
 #define ID_BTN_GAME_BASE  2000   /* 2000 .. 2000+PROFILE_COUNT-1 */
 
 /* Tray */
@@ -67,6 +71,10 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 /* Cross-thread messages */
 #define WM_APP_EVENT      (WM_APP + 2)   /* detector posted an event       */
 #define WM_APP_DEVLOST    (WM_APP + 3)   /* capture thread died unexpectedly */
+
+/* Timers */
+#define TIMER_STATS       2   /* 1 s session clock / counters while running */
+#define TIMER_DEVREFRESH  3   /* coalesces bursts of WM_DEVICECHANGE        */
 
 /* Global hotkey ids */
 #define HK_QUIT           1   /* Ctrl+F10 */
@@ -115,6 +123,9 @@ typedef struct {
     int              tray_added;
 
     int              hotkeys_registered;
+
+    HFONT            ui_font;      /* system message font for every control */
+    HICON            icon_big, icon_small;
 } App;
 
 static App g_app;
@@ -188,8 +199,12 @@ static DWORD WINAPI detector_thread(LPVOID arg) {
                 case SE_VEHICLE:   InterlockedIncrement(&a->stat_veh);  break;
                 case SE_EXPLOSION: InterlockedIncrement(&a->stat_expl); break;
             }
+            /* pan (-1000..1000) in the low word, strength x100 in the high
+             * word; the log used to receive a constant strength of 1.0 and
+             * therefore printed "(33%)" for every event. */
             PostMessageW(a->main_wnd, WM_APP_EVENT, (WPARAM)ev[i].kind,
-                         (LPARAM)(int)(ev[i].pan * 1000));
+                         MAKELPARAM((WORD)(short)(int)(ev[i].pan * 1000.0f),
+                                    (WORD)(int)(ev[i].strength * 100.0f + 0.5f)));
         }
     }
     free(left); free(right);
@@ -256,6 +271,30 @@ static void populate_devices(App *a) {
     }
     if (a->device_count > 0)
         SendMessageW(a->cb_device, CB_SETCURSEL, 0, 0);
+}
+
+/* Re-enumerate endpoints (e.g. after a headset was plugged in) without
+ * losing the device the user had picked. Used while the pipeline is idle. */
+static void refresh_devices_keep_selection(App *a) {
+    wchar_t keep[256];
+    int di = selected_device_index(a);
+    keep[0] = L'\0';
+    if (a->device_count > 0 && di >= 0 && di < a->device_count)
+        lstrcpynW(keep, a->devices[di].id, 256);
+    int before = a->device_count;
+    populate_devices(a);
+    if (keep[0]) {
+        for (int i = 0; i < a->device_count; ++i) {
+            if (lstrcmpW(a->devices[i].id, keep) == 0) {
+                SendMessageW(a->cb_device, CB_SETCURSEL, i, 0);
+                break;
+            }
+        }
+    }
+    if (a->device_count != before)
+        set_status(a, a->device_count > before
+                      ? L"New audio device detected - device list updated."
+                      : L"An audio device was removed - device list updated.");
 }
 
 static OverlayColors colors_from_profile(const GameProfile *p) {
@@ -392,7 +431,7 @@ static void tray_add(App *a) {
     a->nid.uID = TRAY_ID;
     a->nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     a->nid.uCallbackMessage = WM_TRAY;
-    a->nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    a->nid.hIcon = a->icon_small ? a->icon_small : LoadIcon(NULL, IDI_APPLICATION);
     lstrcpynW(a->nid.szTip, L"SoundOverlay", 64);
     Shell_NotifyIconW(NIM_ADD, &a->nid);
     a->tray_added = 1;
@@ -534,7 +573,7 @@ static int start_pipeline(App *a) {
              p->display_name);
     set_status(a, buf);
     /* Start stats timer. */
-    SetTimer(a->main_wnd, 2, 1000, NULL);
+    SetTimer(a->main_wnd, TIMER_STATS, 1000, NULL);
     return 0;
 }
 
@@ -551,6 +590,26 @@ static HWND mk_groupbox(HWND p, const wchar_t *t, int x, int y, int w, int h,
     return CreateWindowExW(0, L"BUTTON", t,
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
         x, y, w, h, p, NULL, inst, NULL);
+}
+
+static BOOL CALLBACK set_font_cb(HWND child, LPARAM font) {
+    SendMessageW(child, WM_SETFONT, (WPARAM)font, TRUE);
+    return TRUE;
+}
+
+static void apply_ui_font(App *a) {
+    NONCLIENTMETRICSW ncm;
+    memset(&ncm, 0, sizeof(ncm));
+    ncm.cbSize = sizeof(ncm);
+    BOOL ok = SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0);
+    if (!ok) {
+        /* Pre-Vista layout of the struct (no iPaddedBorderWidth). */
+        ncm.cbSize = sizeof(ncm) - sizeof(int);
+        ok = SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0);
+    }
+    if (ok) a->ui_font = CreateFontIndirectW(&ncm.lfMessageFont);
+    HFONT f = a->ui_font ? a->ui_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    EnumChildWindows(a->main_wnd, set_font_cb, (LPARAM)f);
 }
 
 static void create_controls(App *a) {
@@ -682,6 +741,15 @@ static void create_controls(App *a) {
         RX, 118, 234, 284, p,
         (HMENU)(INT_PTR)ID_LIST_LOG, inst, NULL);
 
+    CreateWindowExW(0, L"BUTTON", L"Clear log",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        RX, 414, 100, 22, p,
+        (HMENU)(INT_PTR)ID_BTN_CLEARLOG, inst, NULL);
+
+    /* Every control is created with the legacy bitmap "System" font; give
+     * them the system message font (Segoe UI on modern Windows) instead. */
+    apply_ui_font(a);
+
     /* Set a monospace font on the log. */
     HFONT mono = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
@@ -710,7 +778,9 @@ static void on_command(App *a, WPARAM wp) {
         start_pipeline(a);
     } else if (id == ID_BTN_STOP && code == BN_CLICKED) {
         stop_pipeline(a);
-        KillTimer(a->main_wnd, 2);
+        KillTimer(a->main_wnd, TIMER_STATS);
+    } else if (id == ID_BTN_CLEARLOG && code == BN_CLICKED) {
+        SendMessageW(a->list_log, LB_RESETCONTENT, 0, 0);
     } else if (id == ID_CK_SHOW && code == BN_CLICKED) {
         if (a->overlay) {
             if (SendMessageW(a->ck_show, BM_GETCHECK, 0, 0) == BST_CHECKED)
@@ -743,7 +813,7 @@ static void on_command(App *a, WPARAM wp) {
     } else if (id == IDM_TRAY_STARTSTOP) {
         if (a->det_running) {
             stop_pipeline(a);
-            KillTimer(a->main_wnd, 2);   /* match every other stop path */
+            KillTimer(a->main_wnd, TIMER_STATS);   /* match every other stop path */
         } else {
             start_pipeline(a);
         }
@@ -772,8 +842,34 @@ static LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             on_hscroll(a, (HWND)lp);
             return 0;
         case WM_TIMER:
-            if (wp == 2 && a->det_running)
+            if (wp == TIMER_STATS && a->det_running) {
                 update_stats(a);
+            } else if (wp == TIMER_DEVREFRESH) {
+                KillTimer(hwnd, TIMER_DEVREFRESH);
+                /* Only while idle: a running capture owns its endpoint, and
+                 * losing it is reported through WM_APP_DEVLOST instead. */
+                if (!a->det_thread && !a->capture)
+                    refresh_devices_keep_selection(a);
+            }
+            return 0;
+        case WM_DEVICECHANGE:
+            /* Hot-plugging a headset/DAC used to require a restart before it
+             * showed up in the device list. Coalesce the burst of
+             * notifications Windows sends into one refresh. */
+            if (wp == DBT_DEVNODES_CHANGED)
+                SetTimer(hwnd, TIMER_DEVREFRESH, 700, NULL);
+            return TRUE;
+        case WM_QUERYENDSESSION:
+            return TRUE;
+        case WM_ENDSESSION:
+            /* Logoff/shutdown never delivers WM_CLOSE: persist the settings
+             * and release the audio endpoint before the process is torn down. */
+            if (wp) {
+                save_current_settings(a);
+                stop_pipeline(a);
+                KillTimer(hwnd, TIMER_STATS);
+                tray_remove(a);
+            }
             return 0;
         case WM_HOTKEY:
             if ((int)wp == HK_QUIT) {
@@ -788,7 +884,7 @@ static LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             } else if ((int)wp == HK_STARTSTOP) {
                 if (a->det_running) {
                     stop_pipeline(a);
-                    KillTimer(a->main_wnd, 2);
+                    KillTimer(a->main_wnd, TIMER_STATS);
                 } else {
                     start_pipeline(a);
                 }
@@ -812,8 +908,9 @@ static LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         case WM_APP_EVENT: {
             SoundEvent ev;
             ev.kind = (SoundEventKind)(int)wp;
-            ev.pan = (float)(int)lp / 1000.0f;
-            ev.strength = 1.0f;
+            ev.pan = (float)(short)LOWORD(lp) / 1000.0f;
+            ev.strength = (float)HIWORD(lp) / 100.0f;
+            ev.distance = 0;
             ev.timestamp = 0;
             log_event(a, &ev);
             return 0;
@@ -824,7 +921,7 @@ static LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
              * inside it; anything done afterwards could stomp a pipeline the
              * user started from within the modal loop. */
             stop_pipeline(a);
-            KillTimer(hwnd, 2);
+            KillTimer(hwnd, TIMER_STATS);
             populate_devices(a);
             set_status(a, L"Audio device lost! Reconnect and click Start.");
             MessageBoxW(hwnd, L"The audio device was disconnected or became "
@@ -834,7 +931,7 @@ static LRESULT CALLBACK main_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         case WM_CLOSE:
             save_current_settings(a);
             stop_pipeline(a);
-            KillTimer(hwnd, 2);
+            KillTimer(hwnd, TIMER_STATS);
             tray_remove(a);
             if (a->overlay) { overlay_destroy(a->overlay); a->overlay = NULL; }
             DestroyWindow(hwnd);
@@ -862,8 +959,8 @@ static void register_main_class(HINSTANCE inst) {
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = APP_CLASS;
-    wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
-    wc.hIconSm       = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon         = g_app.icon_big   ? g_app.icon_big   : LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIconSm       = g_app.icon_small ? g_app.icon_small : LoadIcon(NULL, IDI_APPLICATION);
     RegisterClassExW(&wc);
 }
 
@@ -872,9 +969,29 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     memset(&g_app, 0, sizeof(g_app));
     g_app.inst = inst;
 
+    /* Single instance: two launchers would fight over the hotkeys and stack
+     * two HUDs. A second launch just brings the existing window forward
+     * (it may be hidden in the tray). */
+    HANDLE instance_mutex = CreateMutexW(NULL, FALSE, APP_MUTEX);
+    if (instance_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND prev_wnd = FindWindowW(APP_CLASS, NULL);
+        if (prev_wnd) {
+            ShowWindow(prev_wnd, SW_SHOW);
+            ShowWindow(prev_wnd, SW_RESTORE);
+            SetForegroundWindow(prev_wnd);
+        }
+        CloseHandle(instance_mutex);
+        return 0;
+    }
+
     INITCOMMONCONTROLSEX icc = { sizeof(icc),
         ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES };
     InitCommonControlsEx(&icc);
+
+    g_app.icon_big   = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON),
+                                         IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+    g_app.icon_small = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON),
+                                         IMAGE_ICON, 16, 16, LR_SHARED);
 
     register_main_class(inst);
 
@@ -930,5 +1047,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             DispatchMessageW(&msg);
         }
     }
+    if (g_app.ui_font) DeleteObject(g_app.ui_font);
+    if (instance_mutex) CloseHandle(instance_mutex);
     return (int)msg.wParam;
 }

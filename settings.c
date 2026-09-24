@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "profiles.h"
 
 #include <shlobj.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@ void settings_defaults(Settings *s) {
     if (!s) return;
     memset(s, 0, sizeof(*s));
     s->profile_index    = 0;
+    s->profile_id[0]    = L'\0';
     s->device_id[0]     = L'\0';
     s->sensitivity_tick = 10;   /* 1.0x */
     s->size             = 320;
@@ -67,6 +69,21 @@ int settings_load(Settings *s) {
 
     GetPrivateProfileStringW(APP_SECTION, L"device", L"",
                              s->device_id, 256, path);
+
+    /* Prefer the stable id over the numeric index: adding or reordering a
+     * profile in profiles.c must never silently switch the user's game.
+     * Files written before profile_id existed fall back to the index. */
+    GetPrivateProfileStringW(APP_SECTION, L"profile_id", L"",
+                             s->profile_id, 64, path);
+    if (s->profile_id[0]) {
+        int idx = profile_index_of(s->profile_id);
+        /* profile_index_of() returns 0 for unknown ids; only trust it when
+         * the id really matches, otherwise keep the index we already read. */
+        if (lstrcmpiW(profile_by_index(idx)->id, s->profile_id) == 0)
+            s->profile_index = idx;
+    }
+    if (s->profile_index < 0 || s->profile_index >= PROFILE_COUNT)
+        s->profile_index = 0;
     return 1;
 }
 
@@ -94,6 +111,8 @@ int settings_save(const Settings *s) {
 
     WritePrivateProfileStringW(APP_SECTION, L"device",
                                s->device_id[0] ? s->device_id : L"", path);
+    WritePrivateProfileStringW(APP_SECTION, L"profile_id",
+                               profile_by_index(s->profile_index)->id, path);
 
     /* Flush the cached writes to disk. */
     WritePrivateProfileStringW(NULL, NULL, NULL, path);

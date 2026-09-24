@@ -49,17 +49,36 @@ static double ov_now(const Overlay *o) {
     return (double)c.QuadPart / o->qpc_freq;
 }
 
+/* Position the HUD inside the *work area* of the monitor it lives on, so it
+ * never sits under the taskbar wherever that is docked (the old code assumed
+ * a 40 px bar along the bottom of the primary monitor). */
 static void place_window(Overlay *o) {
-    int sw = GetSystemMetrics(SM_CXSCREEN);
-    int sh = GetSystemMetrics(SM_CYSCREEN);
-    int m = 24, x = m, y = m;
-    switch (o->pos) {
-        case OP_TOP_LEFT:     x = m;                   y = m; break;
-        case OP_TOP_RIGHT:    x = sw - o->size - m;    y = m; break;
-        case OP_BOTTOM_LEFT:  x = m;                   y = sh - o->size - m - 40; break;
-        case OP_BOTTOM_RIGHT: x = sw - o->size - m;    y = sh - o->size - m - 40; break;
-        case OP_CENTER:       x = (sw - o->size) / 2;  y = (sh - o->size) / 2; break;
+    RECT wa;
+    MONITORINFO mi;
+    HMONITOR mon = MonitorFromWindow(o->hwnd, MONITOR_DEFAULTTOPRIMARY);
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+        wa = mi.rcWork;
+    } else if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
+        wa.left = wa.top = 0;
+        wa.right  = GetSystemMetrics(SM_CXSCREEN);
+        wa.bottom = GetSystemMetrics(SM_CYSCREEN);
     }
+    int ww = wa.right - wa.left, wh = wa.bottom - wa.top;
+    int m = 24, x = wa.left + m, y = wa.top + m;
+    switch (o->pos) {
+        case OP_TOP_LEFT:     x = wa.left + m;                   y = wa.top + m; break;
+        case OP_TOP_RIGHT:    x = wa.right - o->size - m;        y = wa.top + m; break;
+        case OP_BOTTOM_LEFT:  x = wa.left + m;                   y = wa.bottom - o->size - m; break;
+        case OP_BOTTOM_RIGHT: x = wa.right - o->size - m;        y = wa.bottom - o->size - m; break;
+        case OP_CENTER:       x = wa.left + (ww - o->size) / 2;  y = wa.top + (wh - o->size) / 2; break;
+    }
+    /* Keep it on screen even when the HUD is bigger than the work area. */
+    if (x + o->size > wa.right)  x = wa.right - o->size;
+    if (y + o->size > wa.bottom) y = wa.bottom - o->size;
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top)  y = wa.top;
     SetWindowPos(o->hwnd, HWND_TOPMOST, x, y, o->size, o->size,
                  SWP_NOACTIVATE);
 }
